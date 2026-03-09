@@ -1,8 +1,12 @@
 # Core Framework
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
-pydantic==2.5.0
+
+# Data Validation
+pydantic==2.5.3
 pydantic-settings==2.1.0
+
+# File uploads
 python-multipart==0.0.6
 
 # NLP & Sentiment Analysis
@@ -25,11 +29,3 @@ pytz==2023.3
 
 # Logging
 python-json-logger==2.0.7
-
-# Development
-pytest==7.4.3
-pytest-asyncio==0.21.1
-black==23.12.0
-
-# CORS
-fastapi-cors==0.0.6
