@@ -1,0 +1,312 @@
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
+import logging
+from datetime import datetime
+from uuid import uuid4
+
+from app.config import settings
+from app.models.schemas import (
+    ChatRequest, ChatResponse, SentimentScore, Quote,
+    HealthCheck, ErrorResponse, AIGenerationRequest,
+    SentimentAnalysisRequest, QuoteRecommendationRequest
+)
+from app.utils.sentiment_analyzer import sentiment_analyzer
+from app.services.quote_service import quote_service
+from app.services.ai_service import ai_service
+
+# Configure logging
+logging.basicConfig(level=settings.log_level)
+logger = logging.getLogger(__name__)
+
+# Lifespan context manager
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info(f"Starting {settings.app_name} v{settings.app_version}")
+    logger.info(f"Environment: {settings.environment}")
+    yield
+    # Shutdown
+    logger.info("Shutting down application")
+
+# Create FastAPI app
+app = FastAPI(
+    title=settings.app_name,
+    version=settings.app_version,
+    description="AI-powered quotes recommendation chatbot with emotion-based personalization",
+    lifespan=lifespan
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Error handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler"""
+    logger.error(f"Unhandled exception: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal server error",
+            "status_code": 500,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    )
+
+# Health check endpoint
+@app.get("/health", response_model=HealthCheck)
+async def health_check():
+    """Health check endpoint"""
+    return HealthCheck(
+        status="healthy",
+        version=settings.app_version,
+        environment=settings.environment,
+        timestamp=datetime.utcnow()
+    )
+
+# Root endpoint
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": f"Welcome to {settings.app_name}",
+        "version": settings.app_version,
+        "docs": "/docs"
+    }
+
+# ============================================
+# Chat Endpoints
+# ============================================
+
+@app.post(f"{settings.api_prefix}/chat/message", response_model=ChatResponse)
+async def send_message(request: ChatRequest):
+    """
+    Send a message and get AI chatbot response with quote recommendation
+
+    Args:
+        request: ChatRequest with user message and optional user_id
+
+    Returns:
+        ChatResponse with sentiment analysis, detected intent, and recommended quote
+    """
+    message = request.message
+    user_id = request.user_id
+
+    try:
+        # Step 1: Sentiment Analysis
+        sentiment_result = sentiment_analyzer.analyze(message)
+        sentiment = SentimentScore(
+            polarity=sentiment_result['polarity'],
+            subjectivity=sentiment_result['subjectivity'],
+            emotion=sentiment_result['emotion'],
+            confidence=sentiment_result['confidence']
+        )
+
+        # Step 2: Simple intent detection (use Rasa if available)
+        detected_intent = detect_intent(message)
+
+        # Step 3: Get quote recommendation
+        recommended_quote = quote_service.recommend_quote(
+            sentiment=sentiment_result['emotion']
+        )
+
+        # Step 4: Generate AI response
+        quote_text = recommended_quote.text if recommended_quote else ""
+        try:
+            ai_response = ai_service.enhance_chatbot_response(
+                intent=detected_intent,
+                detected_emotion=sentiment_result['emotion'],
+                quote_text=quote_text
+            )
+        except Exception as ai_error:
+            logger.warning(f"AI service failed: {ai_error}, using fallback")
+            ai_response = generate_fallback_response(
+                sentiment_result['emotion'],
+                quote_text
+            )
+
+        # Step 5: Generate suggestions
+        suggestions = generate_suggestions(sentiment_result['emotion'], detected_intent)
+
+        # Create response
+        response = ChatResponse(
+            status="success",
+            user_sentiment=sentiment,
+            detected_intent=detected_intent,
+            quote=recommended_quote,
+            ai_response=ai_response,
+            suggestions=suggestions,
+            message_id=str(uuid4()),
+            timestamp=datetime.utcnow()
+        )
+
+        logger.info(f"Chat message processed: user={user_id}, intent={detected_intent}")
+        return response
+
+    except Exception as e:
+        logger.error(f"Error processing message: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get(f"{settings.api_prefix}/chat/history")
+async def get_history(user_id: str = "default", limit: int = 50):
+    """Get conversation history for a user"""
+    # This would normally fetch from database
+    return {"user_id": user_id, "messages": [], "limit": limit}
+
+@app.delete(f"{settings.api_prefix}/chat/history")
+async def clear_history(user_id: str = "default"):
+    """Clear conversation history"""
+    return {"status": "cleared", "user_id": user_id}
+
+# ============================================
+# Quote Endpoints
+# ============================================
+
+@app.get(f"{settings.api_prefix}/quotes")
+async def get_quotes(category: str = None):
+    """Get all quotes, optionally filtered by category"""
+    quotes = quote_service.get_quotes(category)
+    return {
+        "status": "success",
+        "count": len(quotes),
+        "quotes": quotes
+    }
+
+@app.get(f"{settings.api_prefix}/quotes/category/{{category}}")
+async def get_quotes_by_category(category: str):
+    """Get quotes by category"""
+    quotes = quote_service.get_quotes(category)
+    if not quotes:
+        raise HTTPException(status_code=404, detail="Category not found")
+    return {"category": category, "quotes": quotes}
+
+@app.get(f"{settings.api_prefix}/quotes/sentiment/{{sentiment}}")
+async def get_quotes_by_sentiment(sentiment: str):
+    """Get quotes recommended for a specific sentiment"""
+    quote = quote_service.recommend_quote(sentiment)
+    if not quote:
+        raise HTTPException(status_code=404, detail="No quotes found")
+    return {"sentiment": sentiment, "quote": quote}
+
+@app.post(f"{settings.api_prefix}/quotes/recommend")
+async def recommend_quote(request: QuoteRecommendationRequest):
+    """Get AI-recommended quote based on sentiment"""
+    quote = quote_service.recommend_quote(
+        sentiment=request.sentiment,
+        category=request.category
+    )
+    if not quote:
+        raise HTTPException(status_code=404, detail="No quotes found")
+    return quote
+
+# ============================================
+# AI Endpoints
+# ============================================
+
+@app.post(f"{settings.api_prefix}/ai/generate")
+async def generate_response(request: AIGenerationRequest):
+    """Generate AI response"""
+    try:
+        response = ai_service.generate_response(
+            prompt=request.prompt,
+            context=request.context
+        )
+        return {"text": response}
+    except Exception as e:
+        logger.warning(f"AI response generation failed: {e}, using fallback")
+        return {"text": "I understand. Here's something that might help. Would you like a motivational quote or something to make you smile?"}
+
+@app.post(f"{settings.api_prefix}/ai/analyze")
+async def analyze_sentiment(request: SentimentAnalysisRequest):
+    """Analyze sentiment of text"""
+    result = sentiment_analyzer.analyze(request.text)
+    return {
+        "polarity": result['polarity'],
+        "subjectivity": result['subjectivity'],
+        "emotion": result['emotion'],
+        "confidence": result['confidence']
+    }
+
+@app.get(f"{settings.api_prefix}/ai/suggestions")
+async def get_suggestions(context: str = ""):
+    """Get follow-up suggestions"""
+    try:
+        questions = ai_service.generate_follow_up_questions(context)
+        return {"suggestions": questions if questions else ["Another one", "Different category", "Tell me more"]}
+    except Exception as e:
+        logger.warning(f"Suggestions generation failed: {e}, using defaults")
+        return {"suggestions": ["Another one", "Different category", "Tell me more"]}
+
+# ============================================
+# Helper Functions
+# ============================================
+
+def detect_intent(message: str) -> str:
+    """
+    Simple intent detection
+    In production, use Rasa for better accuracy
+    """
+    message_lower = message.lower()
+
+    intent_keywords = {
+        "ask_motivation": ["motivation", "motivate", "encourage", "push"],
+        "ask_inspiration": ["inspiration", "inspire", "believe"],
+        "ask_success": ["success", "achieve", "accomplish"],
+        "ask_love": ["love", "relationship", "heart"],
+        "ask_humor": ["laugh", "funny", "joke", "humorous"],
+        "ask_random": ["random", "surprise", "any"],
+        "mood_great": ["great", "amazing", "wonderful", "happy"],
+        "mood_unhappy": ["sad", "depressed", "unhappy", "down"],
+        "thank_you": ["thanks", "thank", "appreciate"],
+        "greet": ["hi", "hello", "hey"],
+        "goodbye": ["bye", "goodbye", "farewell"]
+    }
+
+    for intent, keywords in intent_keywords.items():
+        if any(keyword in message_lower for keyword in keywords):
+            return intent
+
+    return "general_inquiry"
+
+def generate_suggestions(emotion: str, intent: str) -> list:
+    """Generate suggestions based on emotion and intent"""
+    suggestions = ["Another one", "Different category", "Tell me more"]
+
+    if emotion == "negative":
+        suggestions.append("More motivation")
+    elif emotion == "positive":
+        suggestions.append("Keep inspiring me")
+
+    return suggestions[:3]
+
+
+def generate_fallback_response(emotion: str, quote_text: str) -> str:
+    """Fallback response when AI is unavailable"""
+    quote_display = f'"{quote_text}"'
+    responses = {
+        "positive": f"That's wonderful! Here's something inspiring:\n\n{quote_display}",
+        "negative": f"I'm here for you. This might help:\n\n{quote_display}",
+        "neutral": f"Here's a good one for you:\n\n{quote_display}",
+        "anxious": f"Take a breath. This might comfort you:\n\n{quote_display}",
+        "confident": f"Keep that energy!\n\n{quote_display}",
+        "mixed": f"Here's something to think about:\n\n{quote_display}",
+    }
+    return responses.get(emotion, f"Here's a quote for you:\n\n{quote_display}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app,
+        host=settings.api_host,
+        port=settings.api_port,
+        reload=settings.debug,
+        log_level=settings.log_level.lower()
+    )
